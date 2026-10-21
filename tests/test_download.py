@@ -9,7 +9,6 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from unittest.mock import MagicMock
 from urllib.parse import urlparse
 
 import httpx
@@ -69,6 +68,8 @@ def storage_provider(tmp_path, test_logger):
 
     settings = StorageProviderSettings(
         cache=str(cache_dir),
+        public_cache=True,
+        discard_response_cookies=True,
         skip_remote_checks=False,
         max_concurrent_downloads=3,
     )
@@ -277,6 +278,8 @@ async def test_cache_staleness_for_mutable_sources(
 
     settings = StorageProviderSettings(
         cache=str(cache_dir),
+        public_cache=True,
+        discard_response_cookies=True,
         skip_remote_checks=False,
         max_concurrent_downloads=3,
     )
@@ -361,7 +364,7 @@ def make_mock_httpr(content: bytes, fail_at: int | None):
         range_header = headers.get("Range") if headers else None
         mock_httpr.received_range_headers.append(range_header)
 
-        response = MagicMock()
+        response = httpx.Response(200, request=httpx.Request(method, request_url))
         if range_header is None:
             response.status_code = 200
             chunk = content
@@ -380,7 +383,13 @@ def make_mock_httpr(content: bytes, fail_at: int | None):
                 raise httpx.ReadError("peer closed connection")
 
         response.aiter_bytes = aiter_bytes
-        response.headers = {"content-length": str(len(chunk))}
+        response.headers = httpx.Headers(
+            {"content-length": str(len(chunk)), "etag": '"v1"'}
+        )
+        if range_header is not None:
+            response.headers["content-range"] = (
+                f"bytes {offset}-{len(content) - 1}/{len(content)}"
+            )
 
         yield response
 
@@ -419,8 +428,8 @@ async def test_resume_on_partial_file(storage_provider, tmp_path):
     await obj.managed_retrieve()
 
     assert len(mock_httpr.received_range_headers) == 2
-    assert mock_httpr.received_range_headers[0] is None  # first attempt: no Range header
+    assert (
+        mock_httpr.received_range_headers[0] is None
+    )  # first attempt: no Range header
     assert mock_httpr.received_range_headers[1] == f"bytes={fail_at}-"
     assert local_path.read_bytes() == full_content
-
-

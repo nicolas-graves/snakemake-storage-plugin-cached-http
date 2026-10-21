@@ -16,9 +16,10 @@ requires-python = ">=3.11"
 dependencies = [
     "httpx ~= 0.27",
     "platformdirs ~= 4.0",
+    "pyyaml >=6,<7",
     "reretry ~= 0.11",
-    "snakemake-interface-common >=1.14,<2.0",
-    "snakemake-interface-storage-plugins >=4.2,<5.0",
+    "snakemake-interface-common >=1.20.1,<2.0",
+    "snakemake-interface-storage-plugins >=4.2.1,<5.0",
     "tqdm-loggable ~= 0.3",
     "typing-extensions ~= 4.15",
     "zstandard ~=0.25.0",
@@ -40,6 +41,8 @@ repository = "https://github.com/pypsa/pypsa-eur"
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
+    "snakemake>=9.13.4,<10",
+    "snakemake-storage-plugin-http>=0.3,<1",
 ]
 
 [build-system]
@@ -66,7 +69,8 @@ dev = [
     "humanfriendly>=10.0",
     "pytest>=8.4.2",
     "pytest-asyncio>=1.2.0",
-    "snakemake>=9.13.4",
+    "snakemake>=9.13.4,<10",
+    "snakemake-storage-plugin-http>=0.3,<1",
 ]
 
 [tool.basedpyright]

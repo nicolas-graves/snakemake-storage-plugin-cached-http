@@ -1,0 +1,384 @@
+#+title: Improve snakemake-storage-plugin-cached-http
+#+date: 2026-10-20
+
+Status: local implementation in this fork authorized by the user on 2026-10-20,
+including launch of an implementing agent. Record precise patch boundaries and
+design decisions as work proceeds; the earlier per-batch confirmation gates
+are superseded by that instruction. Workflow-consumer migration, browser
+integration, upstream submission, commits and pushes remain outside this scope.
+
+* Purpose and boundary
+
+Extend the existing cached-http storage plugin with correct HTTP request
+identity, durable and verifiable cache generations, explicit freshness policy,
+and supported cache import/inspection. Reuse its transport, retry/rate-limit
+handling and source metadata handlers wherever their behavior remains correct.
+Do not introduce a separate project-specific downloader package.
+
+This document must remain useful in the fork without access to the originating
+private workflow repository. All new tests use synthetic data and local HTTP
+fixtures. Workflow migration, scientific parsing and dashboard publication are
+separate projects; they are not part of this patch series.
+
+* Recorded diagnostic baseline
+
+- Selected candidate: [[https://github.com/PyPSA/snakemake-storage-plugin-cached-http/tree/dbe61b45ba93fc8218924afd6380e5e0a6f4cb0e][PyPSA cached-http, dbe61b45ba93fc8218924afd6380e5e0a6f4cb0e]].
+- Comparison: [[https://github.com/snakemake/snakemake-storage-plugin-http/tree/de10eb9adb28941c9b336c22735eec9edc4d5427][Snakemake http, de10eb9adb28941c9b336c22735eec9edc4d5427]].
+- Interface reference: [[https://github.com/snakemake/snakemake-interface-storage-plugins/tree/042c6accc0a1c7afe9d450994074248d1c306ee8][storage interface, 042c6accc0a1c7afe9d450994074248d1c306ee8]].
+- Consumer runtime inspected: Snakemake 9.27.0 and storage interface 4.4.1.
+  The interface reference above is a separately inspected upstream revision;
+  it is not asserted to be the exact source revision of installed 4.4.1.
+
+Line ranges below refer to the cached-http baseline. Refresh them against the
+fork's chosen base before preparing patches. Keep the fork's supported version
+matrix explicit; do not assume compatibility from the consumer runtime alone.
+
+| File / symbol | Diagnostic finding |
+|---------------+--------------------|
+| src/snakemake_storage_plugin_cached_http/cache.py:26–30, Cache._get_cache_path | Cache identity drops scheme, query and representation headers |
+| __init__.py:550–553, StorageObject.local_suffix | Local staging paths also drop query and representation identity |
+| cache.py:47–57, Cache.put | Direct copy, without atomic generations or cross-process locking |
+| __init__.py:670–721, verify_checksum and cache-hit branch | Generic HTTP has no publisher checksum; cache hits bypass verification |
+| __init__.py:317–361, is_immutable/get_http_metadata | Host-based immutability; generic freshness relies on Last-Modified; incomplete HEAD fallback |
+| __init__.py:699–775, StorageObject.managed_retrieve | Metadata fetched before cache lookup, including with skip_remote_checks |
+| __init__.py:98–105, FileMetadata | Missing ETag and response Content-Type/Content-Disposition |
+| __init__.py:265–290, StorageProvider.httpr | Internal header support exists, but is not a supported request-representation API |
+| __init__.py:40 and monkeypatch.py | Import disables ordinary HTTP provider URL acceptance globally |
+
+Unless otherwise qualified, =__init__.py= above is in
+=src/snakemake_storage_plugin_cached_http/=. These are source-inspection
+findings, not proof from executed upstream integration tests.
+
+* Invariants
+
+1. Different response representations cannot share a cache or staging identity.
+2. Failed, partial or interrupted downloads cannot replace a usable generation.
+3. Shared-cache writers coordinate across processes, not only within one client.
+4. A cache hit verifies bytes against recorded integrity metadata. A locally
+   computed digest establishes integrity, not publisher authenticity; use a
+   publisher checksum when one is available.
+5. Software-environment changes, Snakemake staging cleanup and output-cache
+   eviction do not remove or invalidate the persistent HTTP response cache.
+6. Metadata checks and body transfers follow documented policy. Offline means
+   no network, including HEAD, redirects and source metadata APIs.
+7. Storage freshness is separate from cache verification time. Updating a
+   receipt's check timestamp must not spuriously rebuild scientific consumers.
+8. Public shared-cache identity and logs must not expose credentials or mix
+   authenticated responses with anonymous responses.
+9. Scientific validation and source-specific fallback remain consumer-owned.
+
+* Batch 0 — confirm scope and interfaces before patches
+
+Inspect the selected base, its tests, packaging, settings and supported
+Snakemake interfaces. Reproduce the query-collision finding with a local
+fixture during the approved implementation batch. Document provider lifetime,
+storage registration, inventory calls and local/remote retrieval placement.
+
+Record an API/settings table, cache schema and exact patch boundaries for
+batches 1–4 before editing their implementation. Name every existing API whose
+semantics would change. Resolve routine choices within the authorized scope;
+names used later in this plan describe capabilities, not fixed API spellings.
+
+Do not bundle browser automation into the initial patch series. Do not preserve
+an originating project's helper API merely to reduce its migration work.
+
+* Batch 1 — request identity and provider isolation
+
+Primary edits:
+
+- =cache.py=: replace =Cache._get_cache_path= with an identity-derived key.
+- =__init__.py=: align =StorageObject.local_suffix= and metadata/cache lookups
+  with the same identity; extend =StorageProviderSettings= for representation
+  headers as needed.
+- =monkeypatch.py= and its import: remove the global provider interference;
+  document explicit tagged-provider registration and selection instead.
+
+Define a versioned request identity from the actual HTTP request: scheme, host,
+effective port, path, complete query and relevant representation headers.
+Hash a canonical serialization for filesystem names; do not embed raw queries
+or credentials in filenames. Preserve duplicate query keys, blank values and
+query ordering unless equivalence is proven: sorting arbitrary query strings
+can change a server's meaning or invalidate signed requests. Normalize only
+HTTP-equivalent components, ignore fragments and normalize header-name casing.
+
+Document which headers influence identity, including Accept/Accept-Language,
+and how response Vary is handled. An unsupported Vary response must not silently
+be reused as a different representation. Track redirect response metadata
+without collapsing distinct original requests accidentally.
+
+Choose an explicit authentication policy. Public shared-cache mode should
+reject credential-bearing URLs/headers and implicit authenticated responses;
+if authenticated retrieval is supported, define separately scoped storage and
+redaction rather than claiming that hashing credentials makes sharing safe.
+Do not infer public access merely from the absence of an Authorization header.
+
+Acceptance examples:
+
+- =/data?geo=FR= and =/data?geo=DE= have different cache and staging paths.
+- Accept =application/xml= and Accept =application/json= cannot collide.
+- Duplicate/order-sensitive query pairs retain their meaning.
+- Both HTTP providers can be installed and explicitly registered without one
+  changing the other's URL-validation behavior.
+
+* Batch 2 — durable generations, locking and verification
+
+Primary edits: =Cache.get= and =Cache.put= in =cache.py=; retrieval integration
+in =StorageObject.managed_retrieve= and checksum handling in =__init__.py=.
+
+Design one maintained cache schema with immutable digest-named body generations
+and an atomically replaced receipt for each request identity. The receipt should
+record schema version, request identity, body digest/size, retrieval/check times,
+HTTP validators, available publisher checksum and response representation
+metadata. Do not serialize secrets or arbitrary sensitive response headers.
+
+Take a per-identity cross-process lock around deciding and publishing a new
+generation. Recheck after acquiring the lock to avoid duplicate transfers.
+Integrate locking and hashing with the plugin's asynchronous runtime without
+blocking its event loop or causing nested-lock deadlocks. Define supported
+filesystem/OS assumptions and shared-volume locking requirements.
+
+Stream to a temporary file on the destination filesystem. Check transport
+status, completed transfer and available publisher checksum; compute integrity
+metadata; publish the immutable body before atomically switching the receipt.
+Specify whether the guarantee covers process interruption or power loss and
+use appropriate fsync operations if promising the latter. Preserve the previous
+generation on failure. Temporary/orphan files must not be mistaken for hits.
+
+Validate resume semantics: Range/Content-Range, server ignoring Range, resource
+changes and If-Range/validators. Do not concatenate bytes from different
+representations. Validate Content-Length against the corresponding encoded or
+decoded stream correctly; compression must not cause false truncation errors.
+
+On reads, validate receipt structure and verify bytes. Corrupt/missing data is
+a miss online and a clear failure offline, never a silent successful hit.
+Copy/materialize a verified generation atomically into Snakemake staging;
+avoid writable hardlinks that could corrupt the persistent cache.
+
+* Batch 3 — explicit freshness and network policy
+
+Primary edits in =__init__.py=:
+
+- =StorageProviderSettings= and =FileMetadata=.
+- =StorageProvider.get_http_metadata= and =httpr=.
+- =StorageObject.inventory=, =managed_exists=, =managed_mtime=, =managed_size=,
+  and =managed_retrieve=.
+
+Agree and document a policy matrix before implementation:
+
+| Situation | Required behavior |
+|-----------+-------------------|
+| Verified immutable entry | Reuse without metadata/body requests unless explicitly refreshed |
+| Verified checked entry within interval | Reuse without network |
+| Checked entry due, validators available | Conditional validation; 304 retains body generation |
+| HEAD unsupported or inadequate | Controlled documented fallback, not an accidental full GET during size/existence queries |
+| No useful validators | Explicitly define refresh policy and freshness reporting; do not claim a stale entry is freshly validated |
+| Explicit refresh | Attempt new retrieval/validation; preserve previous generation on failure |
+| Offline verified hit | Reuse without any network calls |
+| Offline miss/corruption | Fail clearly without network |
+| Network failure with existing generation | Preserve it; serve stale only under an explicit documented policy |
+
+Persist ETag and Last-Modified and support conditional retrieval. Reconcile
+existing =skip_remote_checks= behavior with the new settings so it cannot be
+mistaken for an offline guarantee. Preserve useful source-specific metadata
+handlers while making generic HTTP policy explicit and user-configurable.
+
+Specify meaningful storage mtime/existence/size semantics for responses lacking
+Last-Modified or size. Test Snakemake's freshness decisions rather than treating
+receipt =checked_at= as the remote file modification time. Document whether
+dry runs/DAG rendering may perform metadata requests for each policy; they
+must not trigger body downloads merely to discover metadata.
+
+* Batch 4 — supported import, inspection and optional retrieval API
+
+Primary edits: public operations in =cache.py=; metadata model and documented
+API in =__init__.py= or a focused new module, plus packaging/docs as needed.
+
+Provide offline cache import accepting an explicit request identity, existing
+body and optional validators/representation metadata. Verify supplied bytes
+and checksums and use the normal locking/publication path. Record validators
+as unknown when unknown; import is not a remote freshness check. Import of
+legacy receipts is a one-time conversion, not a second maintained cache format.
+
+Provide supported inspection and explicit-refresh operations. Decide whether
+these need a CLI, Python API or both before adding entrypoints. Inspection
+should expose identity, digest, size, validation state and useful timestamps
+without disclosing secrets or making requests by default.
+
+Assess a supported retrieval API for clients that issue HTTP requests
+dynamically, such as SDMX data clients fetching structural metadata. Prefer
+declared Snakemake storage inputs when the requests are known. If a reusable
+API is justified, specify body ownership/lifetime, request headers, Content-Type,
+Content-Disposition, final URL, validators, error behavior and sync/async
+integration. It must use the same cache and policy implementation; do not make
+consumers read undocumented receipts or call private provider methods.
+
+Optional probe error markers and scientific XML/ZIP/JSON interpretation remain
+consumer responsibilities. A validation extension, if needed, must have a
+small documented interface and clear publication ordering; do not transplant
+source-specific format assumptions into every HTTP download.
+
+* Deferred browser integration
+
+Neither inspected plugin offers a documented browser retrieval hook. Evaluate
+one only in a separately approved design after the core cache API is stable.
+Keep browser fallback explicitly opt-in and local to the user's existing
+browser session. No provider may start, restart or stop that browser implicitly.
+
+Browser session cookies can make responses authenticated even when a URL is
+public. Specify how such responses are isolated or proven suitable for public
+cache publication. Preserve owned-tab/session cleanup and failure handling.
+A worker's localhost endpoint is not the user's browser; execution placement
+must be explicit. No live browser access is needed for the core patch series.
+
+* Tests and reviewable patch sequence
+
+Extend existing =tests/test_download.py= coverage, preserving source-handler,
+retry and resume behavior. Add focused test modules for identity, cache
+publication and policy if that improves readability. Use the fork's development
+and test tooling; do not depend on a private workflow's Guix manifest or files.
+
+Required deterministic fixtures/checks:
+
+- Query/header identity, redirects, Vary and credential/cache isolation.
+- Independent processes requesting the same representation concurrently.
+- Malformed receipts, corrupted bytes and absent publisher checksums.
+- Interruption before/after body publication and before receipt replacement.
+- HTTP errors, short bodies, compressed transfers and resumed downloads.
+- ETag/Last-Modified changes, 304, missing validators and HEAD 403/405/501.
+- Checked/immutable/refresh/offline policy with asserted HEAD/GET/body counts.
+- Offline import followed by reuse, with no speculative HTTP requests.
+- Snakemake parse/inventory, dry run, DAG, retrieval, cleanup and rerun semantics
+  against the supported version matrix; explicit provider coexistence.
+- Worker-local versus shared cache configuration, and a software-environment
+  change that leaves request identity and cached bytes reusable.
+
+Run focused tests per batch, then the upstream suite and declared compatibility
+checks. Document failures and limits; do not claim the originating workflows
+are migrated merely because plugin tests pass.
+
+* Documentation and adoption handoff
+
+Update the README and plugin docs for request identity, cache schema/location,
+freshness/network policy, public/authenticated boundaries, import/inspection,
+provider coexistence and the supported dynamic-client API, if added. Correct
+the current implications about offline operation and HTTP-provider coexistence.
+Document platform/cache-volume requirements and configuration migration once
+the settings are agreed. Respect upstream licensing and provenance when reusing
+code; original local code is a behavioral reference, not a wholesale transplant.
+
+The workflow migration plan can then reference a tested fork commit/package:
+
+- Install the provider with the Snakemake process and any worker Snakemake
+  runtime, rather than mechanically adding it to scientific job environments.
+- Add a job-runtime dependency only where an approved Python client API is used.
+- Configure explicit cache location/worker propagation and import existing
+  cache bytes before removing private downloader/seeding code.
+- Propose concrete storage-input replacements for each workflow consumer,
+  preserving its output contracts and scientific validation.
+
+Fork implementation, consumer migration and public release are distinct
+completion claims. Record the selected base, approved decisions, test evidence
+and resulting patch revisions as work proceeds. Upstream submission and any
+repository pushes require separate authorization.
+
+* Implementation decisions (2026-10-20)
+
+Base: dbe61b45ba93fc8218924afd6380e5e0a6f4cb0e; Python >=3.11,
+interface-common >=1.14,<2 and interface-storage-plugins >=4.2,<5.
+Provider instances own reentrant HTTPX clients and in-memory source metadata;
+Snakemake calls inventory independently from retrieval. Storage objects retain
+no network clients. Plugin runs in Snakemake runtime, including worker runtimes.
+
+Patch boundaries: cache.py owns RequestIdentity, Cache and atomic materialization;
+retrieval.py owns policy and reusable fetch; __init__.py keeps existing source
+handlers and integrates metadata/settings/storage operations; monkeypatch.py is
+removed. Tests cover isolated deterministic transport plus real local Snakemake.
+
+| Setting / API | Decision |
+|---------------+----------|
+| headers | Anonymous representation headers only; include effective defaults in identity |
+| public_cache | Explicit assertion that configured resources are public; required when caching |
+| policy | auto (known versioned sources immutable), checked, immutable, offline, refresh |
+| check_interval | Seconds until checked retrieval revalidates; default 3600 |
+| skip_remote_checks | Suppresses inventory probes only; never an offline promise |
+| Cache.import_file / inspect | Synchronous offline operations; checked_at=0 on import |
+| StorageProvider.fetch | Async API materializes owned destination and returns receipt |
+| StorageObject.local_suffix | Identity hash; old URL-shaped staging paths are replaced |
+| Cache.get / put | Only schema v1 read; old unverified cache bytes require explicit import |
+
+Request identity preserves ordered raw query, uses HTTPX wire URL normalization,
+includes all permitted representation headers, and strips fragments. Auth URLs,
+known credential/signed queries, arbitrary headers and cookie/auth responses are
+rejected. Public_cache is a caller assertion, not a claim that anonymous access
+proves publication rights. Transport uses trust_env=False, no ambient credentials,
+fixed defaults and refuses session cookies. Unknown Vary and Vary:* fail closed.
+
+Cache assumes POSIX flock, atomic replace and directory fsync on local or correctly
+configured shared filesystems. Async lock acquisition polls nonblocking flock;
+hashing/copies run in threads. Bodies precede fsynced atomic receipt publication;
+orphan bodies/partials are never hits. Old generations are retained; no eviction
+or implicit legacy migration. Writable staging uses atomic copies, never hardlinks.
+
+
+* Completion record (2026-10-21, local changes only)
+
+Batches 0–4 are implemented locally; no commit, push, upstream submission,
+consumer migration or browser integration was performed. There is no resulting
+fork commit to cite until the maintainer requests one.
+
+- RequestIdentity uses the full ordered query and effective anonymous headers;
+  cache and staging use the same SHA-256 identity. Global HTTP monkeypatch removed.
+- Cache v1 uses per-key flock, immutable digest generations, verified reads,
+  atomic fsynced receipts and copied staging. Async cancellation, including
+  repeated cancellation, waits for in-flight filesystem writes before unlocking.
+- Provider.fetch and storage retrieval share checked/immutable/offline/refresh
+  policy, conditional GET, response metadata, publisher checksums and safe resume.
+  Storage retrieval retains the original retry/rate-limit behavior and progress.
+- Cache.import_file, inspect and materialize are supported offline Python APIs.
+  A separate CLI was unnecessary. fetch is the supported async dynamic-client API;
+  it returns a receipt and materializes a caller-owned destination.
+- README and docs/cache.md document settings, public/authenticated boundaries,
+  policy, imports, worker propagation, source caveats and POSIX filesystem needs.
+
+Live tests found two source-specific transport realities: GCS metadata API
+responses use private/no-store controls despite describing public objects, and
+Zenodo public file responses can set session cookies. Transient metadata is never
+published as a file-cache body. New discard_response_cookies=False is the safe
+default; explicit opt-in permits a caller-established public response that sets
+cookies, but every received cookie is discarded and no cookie is ever sent.
+Stored body responses still reject private/no-store and unsupported Vary.
+
+Public-cache scope is an explicit caller assertion (public_cache=True), not an
+inference from absent Authorization. Signed/credential-bearing URLs and arbitrary
+headers are unsupported. Raw URL/selected public metadata exists in receipts,
+though filesystem names and operational logs use no raw query/credentials.
+
+Tested locally on Python 3.12.12:
+
+| Runtime | Evidence |
+|---------+----------|
+| Snakemake 9.27.0 / common 1.23.0 / storage 4.4.1 | Full suite: 86 passed, including upstream live sources and local Snakemake workflow |
+| Snakemake 9.13.4 / common 1.20.1 / storage 4.2.1 | Deterministic cache/import/workflow suite: 51 passed |
+
+The initially inherited common>=1.14 range does not match the supported
+Snakemake>=9.13.4 runtime (requires common>=1.20.1). Packaging now uses
+common>=1.20.1,<2 and storage>=4.2.1,<5 (4.2.1 is the oldest published 4.2 release).
+CI retains Python 3.11/3.12/3.13 tests and adds an explicit oldest-runtime job.
+The other Python versions were not run locally.
+
+Final focused cache/transport/resume verification: 41 passed, including binding
+resumable partials to the observed final redirect URL as well as the original
+target and validator. Newly available publisher checksums are checked even on 304.
+
+Additional checks: Ruff formatting/default correctness rules, Pyflakes and
+=git diff --check=. Local tools/dependencies were installed in a repository
+venv only; old-runtime comparison packages were isolated under /tmp, not system
+Python. The implementation does not depend on the private workflow manifest.
+
+Known operational limits: POSIX locking/fsync filesystem required; no cache GC;
+no private/signed/authenticated responses or browser retrieval; no automatic
+legacy-cache adoption; generic sources without validators cannot announce body
+changes during HEAD-only inventory. Explicit refresh controls retrieval, not
+whether Snakemake schedules an otherwise up-to-date rule. Source API/manifest
+metadata is cached for one provider lifetime. Per-call policy overrides are
+explicit network-policy changes, including overriding a provider's offline default.

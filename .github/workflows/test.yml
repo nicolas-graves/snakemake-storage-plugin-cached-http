@@ -31,3 +31,19 @@ jobs:
     - name: Run tests
       run: |
         uv run --extra dev pytest -v
+
+  test-minimum-runtime:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - uses: astral-sh/setup-uv@v3
+    - name: Check oldest supported runtime against deterministic fixtures
+      run: >-
+        uv run --extra dev
+        --with 'snakemake==9.13.4'
+        --with 'snakemake-interface-common==1.20.1'
+        --with 'snakemake-interface-storage-plugins==4.2.1'
+        pytest -q tests/test_cache_policy.py tests/test_import.py tests/test_workflow.py

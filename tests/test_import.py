@@ -87,3 +87,32 @@ def test_example_queries():
     assert len(examples) > 0
     assert all(hasattr(ex, "query") for ex in examples)
     assert all(hasattr(ex, "description") for ex in examples)
+
+
+def test_http_provider_coexists_without_mutation():
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import snakemake_storage_plugin_http as http
+before = http.StorageProvider.is_valid_query.__func__
+import snakemake_storage_plugin_cached_http
+assert http.StorageProvider.is_valid_query.__func__ is before
+assert http.StorageProvider.is_valid_query('https://example.org/file').valid
+""",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # The integration dependency is optional outside the coexistence test job.
+    if (
+        result.returncode
+        and "No module named 'snakemake_storage_plugin_http'" in result.stderr
+    ):
+        __import__("pytest").skip("ordinary HTTP plugin is not installed")
+    assert result.returncode == 0, result.stderr

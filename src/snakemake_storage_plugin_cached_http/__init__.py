@@ -6,7 +6,7 @@ import asyncio
 import base64
 import hashlib
 import json
-import shutil
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -14,7 +14,7 @@ from datetime import datetime
 from email.utils import parsedate_to_datetime
 from logging import Logger
 from pathlib import Path
-from posixpath import basename, dirname, join, normpath, relpath
+from posixpath import dirname, join, normpath, relpath
 from typing import cast
 from urllib.parse import ParseResult, quote, urlparse
 
@@ -34,11 +34,10 @@ from snakemake_interface_storage_plugins.storage_provider import (
     StorageProviderBase,
     StorageQueryValidationResult,
 )
-from tqdm_loggable.auto import tqdm
 from typing_extensions import override
 
-from . import monkeypatch  # noqa: F401
-from .cache import Cache
+from .cache import Cache, RequestIdentity
+from .retrieval import cached_metadata, fetch
 
 logger = get_logger()
 
@@ -70,6 +69,41 @@ class ReretryLoggerAdapter:
 # unsupported max_requests_per_second option
 @dataclass
 class StorageProviderSettings(SettingsBase):
+    public_cache: bool = field(
+        default=False,
+        metadata={
+            "help": "Assert that all configured responses are public; required for persistent caching.",
+            "env_var": True,
+        },
+    )
+    discard_response_cookies: bool = field(
+        default=False,
+        metadata={
+            "help": "Explicitly allow public responses that set cookies; cookies are discarded and never sent.",
+            "env_var": True,
+        },
+    )
+    headers: dict[str, str] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Anonymous representation headers (Accept, Accept-Language, Accept-Encoding, User-Agent)."
+        },
+    )
+    policy: str = field(
+        default="auto",
+        metadata={
+            "help": "auto, checked, immutable, offline or refresh",
+            "env_var": True,
+        },
+    )
+    check_interval: float = field(
+        default=3600,
+        metadata={
+            "help": "Seconds between conditional retrieval checks",
+            "env_var": True,
+        },
+    )
+
     cache: str = field(
         default_factory=lambda: platformdirs.user_cache_dir(
             "snakemake-pypsa-eur", ensure_exists=False
@@ -103,6 +137,11 @@ class FileMetadata:
     size: int
     mtime: float = 0  # modification time (Unix timestamp), used for GCS
     redirect: str | None = None  # used to indicate data.pypsa.org redirection
+    etag: str | None = None
+    last_modified: str | None = None
+    content_type: str | None = None
+    content_disposition: str | None = None
+    final_url: str | None = None
 
 
 class WrongChecksum(Exception):
@@ -136,6 +175,26 @@ class StorageProvider(StorageProviderBase):
     def __post_init__(self):
         super().__post_init__()
 
+        if self.settings.policy not in {
+            "auto",
+            "checked",
+            "immutable",
+            "offline",
+            "refresh",
+        }:
+            raise ValueError("Invalid cached-http policy")
+        if (
+            self.settings.check_interval < 0
+            or self.settings.max_concurrent_downloads < 1
+        ):
+            raise ValueError(
+                "check_interval must be nonnegative and concurrency positive"
+            )
+        RequestIdentity.create("https://example.org/", self.settings.headers)
+        if self.settings.cache and not self.settings.public_cache:
+            raise ValueError(
+                "Persistent caching requires public_cache=True: assert that the configured responses are public"
+            )
         # Set up cache
         self.cache = (
             Cache(cache_dir=Path(self.settings.cache)) if self.settings.cache else None
@@ -149,6 +208,7 @@ class StorageProvider(StorageProviderBase):
         self._zenodo_record_cache: dict[str, dict[str, FileMetadata]] = {}
         self._pypsa_manifest_cache: dict[str, dict[str, FileMetadata]] = {}
         self._gcs_metadata_cache: dict[str, FileMetadata] = {}
+        self._inventory_metadata: dict[str, FileMetadata | None] = {}
 
     @override
     def use_rate_limiter(self) -> bool:
@@ -234,7 +294,7 @@ class StorageProvider(StorageProviderBase):
             timeout = httpx.Timeout(60, pool=None)
 
             self._client = httpx.AsyncClient(
-                follow_redirects=True, limits=limits, timeout=timeout
+                follow_redirects=False, limits=limits, timeout=timeout, trust_env=False
             )
 
         try:
@@ -277,7 +337,7 @@ class StorageProvider(StorageProviderBase):
         try:
             async with (
                 self.client() as client,
-                client.stream(method, url, headers=headers) as response,
+                self._stream_public(client, method, url, headers) as response,
             ):
                 wait_time = self._get_rate_limit_wait_time(response.headers)
                 if wait_time is not None:
@@ -289,8 +349,45 @@ class StorageProvider(StorageProviderBase):
 
                 yield response
         except Exception as e:
-            logger.warning(f"{type(e).__name__} while {method}'ing {url}")
+            logger.warning(f"{type(e).__name__} during public HTTP request")
             raise
+
+    @asynccontextmanager
+    async def _stream_public(self, client, method, url, headers):
+        # Follow redirects explicitly: inspect every hop before forwarding anything.
+        effective = dict(RequestIdentity.create(url, self.settings.headers).headers)
+        effective.update(headers or {})
+        for _ in range(20):
+            RequestIdentity.create(url, self.settings.headers)
+            request = client.build_request(method, url, headers=effective)
+            request.headers.pop("cookie", None)
+            response = await client.send(request, stream=True)
+            try:
+                from .retrieval import validate_response
+
+                validate_response(
+                    response,
+                    cacheable=False,
+                    allow_cookies=self.settings.discard_response_cookies,
+                )
+                if response.is_redirect and response.next_request is not None:
+                    url = str(response.next_request.url)
+                    continue
+                yield response
+                return
+            finally:
+                await response.aclose()
+                client.cookies.clear()
+        raise ValueError("Too many HTTP redirects")
+
+    async def fetch(self, url: str, destination: Path, *, policy: str | None = None):
+        """Materialize an anonymous representation; return verified response metadata.
+
+        Destination belongs to the caller. No cache-internal path is exposed.
+        Use settings.headers to choose representation, and policy='refresh' for
+        explicit validation. This asynchronous API shares storage policy/locking.
+        """
+        return await fetch(self, url, Path(destination), policy=policy)
 
     @retry_decorator
     async def get_metadata(self, url: ParseResult) -> FileMetadata | None:
@@ -304,7 +401,12 @@ class StorageProvider(StorageProviderBase):
         Returns:
             FileMetadata or None if not found
         """
+        if self.settings.policy == "offline":
+            result = await cached_metadata(self, url.geturl())
+            return result
         netloc = url.netloc
+        if self.settings.headers or url.query:
+            return await self.get_http_metadata(url)
         if netloc in ("zenodo.org", "sandbox.zenodo.org"):
             return await self.get_zenodo_metadata(url)
         elif netloc == "data.pypsa.org":
@@ -316,7 +418,15 @@ class StorageProvider(StorageProviderBase):
 
     @staticmethod
     def is_immutable(url: ParseResult) -> bool:
-        return url.netloc in ("zenodo.org", "sandbox.zenodo.org", "data.pypsa.org")
+        # Source compatibility helper; operational policy additionally accounts
+        # for representation headers in retrieval.immutable.
+        if url.query:
+            return False
+        return (
+            url.netloc in {"zenodo.org", "sandbox.zenodo.org"}
+            and url.path.startswith("/records/")
+            and "/files/" in url.path
+        ) or (url.netloc == "data.pypsa.org" and url.path.startswith("/workflows/"))
 
     async def get_http_metadata(self, parsed: ParseResult) -> FileMetadata | None:
         """
@@ -330,16 +440,13 @@ class StorageProvider(StorageProviderBase):
         """
         url = parsed.geturl()
 
-        async with self.client() as client:
-            try:
-                response = await client.head(url)
-            except Exception as e:
-                logger.warning(f"{type(e).__name__} while head'ing {url}")
-                raise
+        async with self.httpr("head", url) as response:
+            # HEAD never downloads a body, including unsupported/inadequate HEAD.
+            pass
 
         if response.status_code == 404:
             return None
-        if response.status_code == 405:
+        if response.status_code in (403, 405, 501):
             # HEAD not supported; assume file exists with unknown size/mtime
             return FileMetadata(checksum=None, size=0, mtime=0.0)
         response.raise_for_status()
@@ -350,7 +457,7 @@ class StorageProvider(StorageProviderBase):
         if last_modified:
             try:
                 mtime = cast(datetime, parsedate_to_datetime(last_modified)).timestamp()
-            except Exception:
+            except (TypeError, ValueError, OverflowError):
                 logger.debug(
                     f"HTTP last-modified not in RFC2822 format: `{last_modified}`"
                 )
@@ -358,7 +465,25 @@ class StorageProvider(StorageProviderBase):
         else:
             mtime = 0.0
 
-        return FileMetadata(checksum=None, size=size, mtime=mtime)
+        identity = RequestIdentity.create(url, self.settings.headers)
+        if self.cache:
+            old = await asyncio.to_thread(self.cache.inspect, identity)
+            if old:
+                etag = response.headers.get("etag")
+                if etag and old.get("etag") and etag != old["etag"]:
+                    mtime = max(time.time(), old["mtime"] + 1)
+                elif not mtime:
+                    mtime = old["mtime"]
+        return FileMetadata(
+            checksum=None,
+            size=size,
+            mtime=mtime,
+            etag=response.headers.get("etag"),
+            last_modified=response.headers.get("last-modified"),
+            content_type=response.headers.get("content-type"),
+            content_disposition=response.headers.get("content-disposition"),
+            final_url=str(response.url),
+        )
 
     async def get_zenodo_metadata(self, url: ParseResult) -> FileMetadata | None:
         """
@@ -550,7 +675,9 @@ class StorageObject(StorageObjectRead):
     @override
     def local_suffix(self) -> str:
         """Return the local suffix for this object (used by parent class)."""
-        return f"{self.url.netloc}{self.url.path}"
+        return RequestIdentity.create(
+            str(self.query), self.provider.settings.headers
+        ).key
 
     @override
     def get_inventory_parent(self) -> str | None:
@@ -558,98 +685,48 @@ class StorageObject(StorageObjectRead):
         # this is optional and can be left as is
         return None
 
+    async def _metadata(self):
+        cached = await cached_metadata(self.provider, str(self.query))
+        if cached is not None:
+            return cached
+        if self.provider.settings.policy == "offline":
+            raise FileNotFoundError("Offline cache miss or corrupt representation")
+        if self.provider.settings.skip_remote_checks:
+            return FileMetadata(checksum=None, size=0)
+        key = self.local_suffix()
+        if key not in self.provider._inventory_metadata:
+            self.provider._inventory_metadata[key] = await self.provider.get_metadata(
+                self.url
+            )
+        return self.provider._inventory_metadata[key]
+
     @override
     async def managed_exists(self) -> bool:
-        if self.provider.settings.skip_remote_checks:
-            return True
-
-        if self.provider.cache:
-            cached = self.provider.cache.get(str(self.query))
-            if cached is not None and self.provider.is_immutable(self.url):
-                return True
-
-        metadata = await self.provider.get_metadata(self.url)
-        return metadata is not None
+        return await self._metadata() is not None
 
     @override
     async def managed_mtime(self) -> float:
-        if self.provider.settings.skip_remote_checks:
-            return 0
-
-        metadata = await self.provider.get_metadata(self.url)
+        metadata = await self._metadata()
         return metadata.mtime if metadata is not None else 0
 
     @override
     async def managed_size(self) -> int:
-        if self.provider.settings.skip_remote_checks:
-            return 0
-
-        if self.provider.cache:
-            cached = self.provider.cache.get(str(self.query))
-            if cached is not None and self.provider.is_immutable(self.url):
-                return cached.stat().st_size
-        else:
-            cached = None
-
-        metadata = await self.provider.get_metadata(self.url)
-        if metadata is None:
-            return 0
-
-        if cached is not None:
-            if cached.stat().st_mtime >= metadata.mtime:
-                return cached.stat().st_size
-
-        return metadata.size
+        metadata = await self._metadata()
+        return metadata.size if metadata is not None else 0
 
     @override
     async def inventory(self, cache: IOCacheStorageInterface) -> None:
-        """
-        Gather file metadata (existence, size) from cache or remote.
-        Checks local cache first, then queries remote if needed.
-        """
         key = self.cache_key()
         if key in cache.exists_in_storage:
-            # Already inventorized
             return
-
-        if self.provider.settings.skip_remote_checks:
-            cache.exists_in_storage[key] = True
-            cache.mtime[key] = Mtime(storage=0)
-            cache.size[key] = 0
-            return
-
-        if self.provider.cache:
-            cached = self.provider.cache.get(str(self.query))
-            if cached is not None and self.provider.is_immutable(self.url):
-                cache.exists_in_storage[key] = True
-                cache.mtime[key] = Mtime(storage=cached.stat().st_mtime)
-                cache.size[key] = cached.stat().st_size
-                return
-        else:
-            cached = None
-
-        metadata = await self.provider.get_metadata(self.url)
-        if metadata is None:
-            cache.exists_in_storage[key] = False
-            cache.mtime[key] = Mtime(storage=0)
-            cache.size[key] = 0
-            return
-
-        if cached is not None:
-            if cached.stat().st_mtime >= metadata.mtime:
-                cache.exists_in_storage[key] = True
-                cache.mtime[key] = Mtime(storage=cached.stat().st_mtime)
-                cache.size[key] = cached.stat().st_size
-                return
-
-        cache.exists_in_storage[key] = True
-        cache.mtime[key] = Mtime(storage=metadata.mtime)
-        cache.size[key] = metadata.size
+        metadata = await self._metadata()
+        cache.exists_in_storage[key] = metadata is not None
+        cache.mtime[key] = Mtime(storage=metadata.mtime if metadata else 0)
+        cache.size[key] = metadata.size if metadata else 0
 
     @override
     def cleanup(self):
         """Nothing to cleanup"""
-        pass
 
     @override
     def exists(self) -> bool:
@@ -689,87 +766,29 @@ class StorageObject(StorageObjectRead):
             with open(path, "rb") as f:
                 return hashlib.file_digest(f, digest).hexdigest().lower()
 
-        # Compute checksum asynchronously (hashlib releases GIL)
-        # checksum_observed = await asyncio.to_thread(compute_hash)
-        checksum_observed = compute_hash(path, digest)
+        # Hash large scientific inputs without blocking the async event loop.
+        checksum_observed = await asyncio.to_thread(compute_hash, path, digest)
 
         if checksum_expected != checksum_observed:
             raise WrongChecksum(observed=checksum_observed, expected=checksum_expected)
 
-    @retry_decorator
     async def managed_retrieve(self):
-        """Async download with concurrency control and progress bar"""
-        local_path = self.local_path()
-        local_path.parent.mkdir(parents=True, exist_ok=True)
+        # Keep private partials alive through retries even with cache disabled.
+        if self.provider.cache is None and self.provider.settings.policy != "offline":
+            from .retrieval import _fetch
 
-        query = str(self.query)
-        filename = basename(self.url.path)
-
-        metadata = await self.provider.get_metadata(self.url)
-        if metadata is not None and metadata.redirect is not None:
-            query = self.url._replace(path=f"/{metadata.redirect}").geturl()
-
-        # If already in cache, check if still valid
-        if self.provider.cache:
-            cached = self.provider.cache.get(query)
-            if cached is not None:
-                if self.provider.is_immutable(self.url) or (
-                    metadata is not None and cached.stat().st_mtime >= metadata.mtime
-                ):
-                    logger.info(f"Retrieved {filename} from cache ({query})")
-                    shutil.copy2(cached, local_path)
-                    return
-
-        try:
-            # Check for existing partial file to resume
-            offset = local_path.stat().st_size if local_path.exists() else 0
-            headers = {"Range": f"bytes={offset}-"} if offset > 0 else None
-
-            # Download using a get request, rate limit errors are detected and raise
-            # WorkflowError to trigger a retry
-            async with self.provider.httpr("get", query, headers=headers) as response:
-                if response.status_code == 206:
-                    # Server supports resume - append to existing partial file
-                    mode = "ab"
-                    logger.info(f"Resuming {filename} from byte {offset}")
-                elif response.status_code == 200:
-                    # Server doesn't support Range - discard partial and restart
-                    mode = "wb"
-                    offset = 0
-                else:
-                    response.raise_for_status()
-                    raise AssertionError(
-                        f"Unhandled status code: {response.status_code}"
-                    )
-
-                total_size = int(response.headers.get("content-length", 0)) + offset
-
-                # Download to local path with progress bar
-                with local_path.open(mode=mode) as f:
-                    with tqdm(
-                        total=total_size,
-                        initial=offset,
-                        unit="B",
-                        unit_scale=True,
-                        desc=filename,
-                        position=None,
-                        leave=True,
-                    ) as pbar:
-                        async for chunk in response.aiter_bytes(chunk_size=8192):
-                            f.write(chunk)
-                            pbar.update(len(chunk))
-
-            await self.verify_checksum(local_path)
-
-            # Copy to cache after successful verification
-            if self.provider.cache:
-                self.provider.cache.put(query, local_path)
-
-        except httpx.TransportError:
-            # Mid-transfer interruption - keep partial file for resume on next retry
-            raise
-        except:  # noqa: E722
-            # Any other error (wrong checksum, HTTP error, KeyboardInterrupt) - delete and maybe restart
-            if local_path.exists():
-                local_path.unlink()
-            raise
+            with tempfile.TemporaryDirectory(prefix="cached-http-") as directory:
+                identity = RequestIdentity.create(
+                    str(self.query), self.provider.settings.headers
+                )
+                await retry_decorator(_fetch)(
+                    self.provider,
+                    Cache(Path(directory)),
+                    identity,
+                    self.local_path(),
+                    self.provider.settings.policy,
+                )
+        else:
+            await retry_decorator(self.provider.fetch)(
+                str(self.query), self.local_path()
+            )

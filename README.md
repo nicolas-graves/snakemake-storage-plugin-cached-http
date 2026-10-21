@@ -5,173 +5,167 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # Snakemake Storage Plugin: Cached HTTP
 
-A Snakemake storage plugin for downloading files via HTTP with local caching, checksum verification, and adaptive rate limiting.
+HTTP inputs with persistent verified caching, conditional retrieval, public-source
+checksum handlers, rate limiting and safe resumable transfers. Supports Python
+3.11–3.13 and Snakemake's storage interface `>=4.2.1,<5`.
 
-**Supported sources:**
-- **zenodo.org** - Zenodo data repository (checksum from API)
-- **data.pypsa.org** - PyPSA data repository (checksum from manifest.yaml)
-- **storage.googleapis.com** - Google Cloud Storage (checksum from GCS JSON API)
-- **any http(s) URL** - Generic fallback with size/mtime from HTTP headers
-
-## Features
-
-- **Local caching**: Downloads are cached to avoid redundant transfers (can be disabled)
-- **Checksum verification**: Automatically verifies checksums (from Zenodo API, data.pypsa.org manifests, or GCS object metadata)
-- **Rate limit handling**: Automatically respects Zenodo's rate limits using `X-RateLimit-*` headers with exponential backoff retry
-- **Concurrent download control**: Limits simultaneous downloads to prevent overwhelming servers
-- **Resumable downloads**: Interrupted transfers resume from where they left off using HTTP range requests
-- **Progress bars**: Shows download progress with tqdm
-- **Immutable URLs**: Returns mtime=0 for Zenodo and data.pypsa.org (persistent URLs); uses actual mtime for GCS and generic HTTP
-- **Environment variable support**: Configure via environment variables for CI/CD workflows
-
-## Installation
-
-From the pypsa-eur repository root:
-
-```bash
-pip install -e plugins/snakemake-storage-plugin-cached-http
+```sh
+pip install -e '.[dev]'
+pytest -q
 ```
 
-## Configuration
-
-The Zenodo storage plugin works alongside other storage providers (like HTTP). Snakemake automatically routes URLs to the correct provider based on the URL pattern.
-
-Register additional settings in your Snakefile if you want to customize the defaults:
+## Explicit provider registration
 
 ```python
-# Optional: Configure cached HTTP storage with custom settings
-# This extends the existing storage configuration (e.g., for HTTP)
 storage cached_http:
     provider="cached-http",
-    cache="~/.cache/snakemake-pypsa-eur",  # Default location
-    max_concurrent_downloads=3,  # Download max 3 files at once
+    cache="~/.cache/snakemake-pypsa-eur",
+    public_cache=True,
+    policy="checked",
+    check_interval=3600,
+    headers={"Accept": "application/json"},
+
+rule download:
+    input: storage.cached_http("https://example.org/data?geo=FR")
+    output: "data.json"
+    shell: "cp {input} {output}"
 ```
 
-If you don't explicitly configure it, the plugin will use default settings automatically.
+`public_cache=True` asserts that the configured response representations are public
+and suitable for persistent reuse. It is required when persistent caching is on.
+Absence of credentials alone does not establish that. Authenticated retrieval and
+browser fallback are outside this plugin's public-cache contract.
 
-### Settings
+Both `http` and `cached-http` providers may be installed. Use tagged registration
+and `storage.cached_http(...)` / `storage.http(...)` to choose explicitly; generic
+`storage(url)` can be ambiguous. Importing this plugin never modifies the other
+provider.
 
-- **cache** (optional): Cache directory for downloaded files
-  - Default: Platform-dependent user cache directory (via `platformdirs.user_cache_dir("snakemake-pypsa-eur")`)
-  - Set to `""` (empty string) to disable caching
-  - Files are cached here to avoid re-downloading
-  - Environment variable: `SNAKEMAKE_STORAGE_CACHED_HTTP_CACHE`
+## Settings
 
-- **skip_remote_checks** (optional): Skip metadata checking with remote API
-  - Default: `False` (perform checks)
-  - Set to `True` or `"1"` to skip remote existence/size checks (useful for CI/CD)
-  - Environment variable: `SNAKEMAKE_STORAGE_CACHED_HTTP_SKIP_REMOTE_CHECKS`
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `cache` | platform user cache for `snakemake-pypsa-eur` | Persistent cache root; `""` disables persistence |
+| `public_cache` | `False` | Explicit public-resource assertion required for persistent caching |
+| `policy` | `"auto"` | `auto`, `checked`, `immutable`, `offline`, or `refresh` |
+| `check_interval` | `3600` | Seconds before a checked entry needs conditional retrieval |
+| `headers` | `{}` | Representation headers; configure in the Snakefile/Python API |
+| `discard_response_cookies` | `False` | Explicitly permit public responses that set cookies; discard every cookie |
+| `skip_remote_checks` | `False` | Suppress inventory metadata probes; retrieval may still use the network |
+| `max_concurrent_downloads` | `3` | Maximum HTTP connections per provider instance |
 
-- **max_concurrent_downloads** (optional): Maximum concurrent downloads
-  - Default: `3`
-  - Controls how many files can be downloaded simultaneously
-  - No environment variable support
+Scalar settings except concurrency support plugin environment variables, e.g.
+`SNAKEMAKE_STORAGE_CACHED_HTTP_CACHE` and
+`SNAKEMAKE_STORAGE_CACHED_HTTP_POLICY`. Representation headers are configured in
+Python or the Snakefile; they are not a credential channel.
 
-## Usage
+## Freshness and network behavior
 
-Use any HTTP(S) URL directly in your rules. Snakemake automatically routes all HTTP(S) URLs to this plugin:
+| Policy | Verified hit | Miss/corruption |
+| --- | --- | --- |
+| `auto` | Reuse recognized versioned source URLs indefinitely; otherwise checked policy | Download and verify |
+| `checked` | Reuse within interval, then conditional GET using ETag/Last-Modified | Download and verify |
+| `immutable` | Reuse without network | Download and verify |
+| `offline` | Reuse without any HTTP, including metadata APIs | Fail without network |
+| `refresh` | Conditional GET on each retrieval; no stale-on-error fallback | Download and verify |
+
+A 304 keeps the body and storage mtime; only the check time advances. Without
+validators, a due retrieval downloads the complete body; identical content keeps
+its storage mtime. Failures preserve previous cached bytes and staging outputs,
+but are reported rather than silently returning stale data.
+
+Inventory, dry runs and DAG rendering may perform **HEAD or source metadata API**
+requests when an entry is missing or due. They never fetch a file body just to
+learn size/existence. HEAD 403/405/501 yields unknown size/mtime; retrieval resolves
+that uncertainty. A generic server with neither validators nor Last-Modified
+cannot reliably announce changes during inventory. Use explicit refresh/forced
+retrieval when change detection is required for such a source. `refresh` controls
+retrieval; it does not itself force Snakemake to schedule an up-to-date rule.
+
+Known handlers retain publisher checksums: Zenodo API, PyPSA manifests and GCS
+metadata. `auto` recognizes Zenodo record-file URLs and PyPSA workflow-file paths;
+use explicit `checked` if a publisher changes those resources in place. Headers
+or query parameters disable this automatic immutability classification.
+
+Zenodo can set a session cookie even on public files. After establishing that the
+selected files are public, opt into `discard_response_cookies=True`. No received
+cookie is ever sent on a later request, redirect or retry. Private/no-store body
+responses, authentication challenges and unsupported `Vary` dimensions still fail.
+Source metadata responses are transient and may have private/no-store controls;
+they are never published as cached file bodies.
+
+## Durable cache and import
+
+Schema v1 stores hashed request identities, immutable SHA-256 body generations and
+an atomically replaced receipt under `<cache>/v1/<identity>/`. Identity includes
+the full ordered query and effective representation headers. XML and JSON or FR
+and DE queries cannot collide; secrets and query strings never appear in filenames.
+Receipts include public URLs and permitted headers, so the cache directory itself
+must have appropriate filesystem access controls.
+
+Every cache hit checks size, SHA-256 and any publisher checksum. Local integrity
+hashes do not establish publisher authenticity. Corrupt entries are misses online
+and errors offline. Per-identity POSIX process locks deduplicate writers, and
+atomic fsynced publication preserves previous generations on interrupted refresh.
+Staging uses copies, never writable hardlinks. There is no automatic eviction.
+
+Old URL-shaped cache entries are not read implicitly. Import approved public bytes
+using the supported offline API:
 
 ```python
-rule download_zenodo:
-    input:
-        storage("https://zenodo.org/records/3520874/files/natura.tiff"),
-    output:
-        "resources/natura.tiff"
-    shell:
-        "cp {input} {output}"
+from pathlib import Path
+from snakemake_storage_plugin_cached_http.cache import Cache, RequestIdentity
 
-rule download_pypsa:
-    input:
-        storage("https://data.pypsa.org/workflows/eur/eez/v12_20231025/World_EEZ_v12_20231025_LR.zip"),
-    output:
-        "resources/eez.zip"
-    shell:
-        "cp {input} {output}"
-
-rule download_gcs:
-    input:
-        storage("https://storage.googleapis.com/open-tyndp-data-store/CBA_projects.zip"),
-    output:
-        "resources/cba_projects.zip"
-    shell:
-        "cp {input} {output}"
-
-rule download_generic:
-    input:
-        storage("https://example.com/data/dataset.csv"),
-    output:
-        "resources/dataset.csv"
-    shell:
-        "cp {input} {output}"
+cache = Cache(Path("~/.cache/snakemake-pypsa-eur"))
+request = RequestIdentity.create(
+    "https://example.org/data?geo=FR", {"Accept": "application/json"}
+)
+receipt = cache.import_file(request, Path("existing.json"))
+assert receipt["checked_at"] == 0  # import is not a remote freshness check
+print(cache.inspect(request))     # verifies bytes; never makes a request
+cache.materialize(request, Path("copy.json"))
 ```
 
-Or if you configured a tagged storage entity:
+Import accepts optional `publisher_checksum="sha256:..."` (or a supported hashlib
+algorithm) and metadata keys `etag`, `last_modified`, `mtime`, `content_type`,
+`content_disposition`, `final_url`. Unknown validators stay unknown. Importing a
+legacy downloader's receipt means translating those fields once, explicitly; the
+plugin does not maintain that receipt format.
+
+## Dynamic asynchronous client API
+
+Prefer declared storage inputs when requests are known. A client discovering URLs
+at runtime may use the same implementation through `StorageProvider.fetch`:
 
 ```python
-rule download_data:
-    input:
-        storage.cached_http(
-            "https://zenodo.org/records/3520874/files/natura.tiff"
-        ),
-    output:
-        "resources/natura.tiff"
-    shell:
-        "cp {input} {output}"
+import asyncio
+import logging
+from pathlib import Path
+from snakemake_storage_plugin_cached_http import StorageProvider, StorageProviderSettings
+
+provider = StorageProvider(
+    local_prefix=Path(".stage"), logger=logging.getLogger("downloads"),
+    settings=StorageProviderSettings(
+        cache=".response-cache", public_cache=True, policy="checked",
+        headers={"Accept": "application/xml"},
+    ),
+)
+receipt = asyncio.run(provider.fetch("https://example.org/structure?id=1", Path("structure.xml")))
+print(receipt["content_type"], receipt["final_url"])
 ```
 
-The plugin will:
-1. Check if the file exists in the cache (if caching is enabled)
-2. If cached, copy from cache (fast)
-3. If not cached, download with:
-   - Progress bar showing download status
-   - Automatic rate limit handling with exponential backoff retry
-   - Concurrent download limiting
-   - Checksum verification where available (Zenodo API, data.pypsa.org manifest, GCS metadata)
-4. Store in cache for future use (if caching is enabled)
+The caller owns the destination and its lifetime; internal cache body paths are
+not part of this retrieval API. The returned verified receipt includes digest,
+size, timestamps, validators and selected response metadata. `policy="refresh"`
+overrides policy for one call. `fetch` performs one attempt and reports HTTPX
+transport/status errors, validation/checksum errors or offline `FileNotFoundError`.
+Storage retrieval wraps this API in the existing five-attempt exponential retry
+and rate-limit handling. Synchronous clients can call `asyncio.run` outside an
+existing event loop; asynchronous clients must await the call. Scientific parsing
+and validation belong to the caller.
 
-### Example: CI/CD Configuration
-
-For continuous integration environments where you want to skip caching and remote checks:
-
-```yaml
-# GitHub Actions example
-- name: Run snakemake workflows
-  env:
-    SNAKEMAKE_STORAGE_CACHED_HTTP_CACHE: ""
-    SNAKEMAKE_STORAGE_CACHED_HTTP_SKIP_REMOTE_CHECKS: "1"
-  run: |
-    snakemake --cores all
-```
-
-## Rate Limiting and Retry
-
-Zenodo API limits:
-- **Guest users**: 60 requests/minute
-- **Authenticated users**: 100 requests/minute
-
-The plugin automatically:
-- Monitors `X-RateLimit-Remaining` header
-- Waits when rate limit is reached
-- Uses `X-RateLimit-Reset` to calculate wait time
-- Retries failed requests with exponential backoff (up to 5 attempts)
-- Handles transient errors: HTTP errors, timeouts, checksum mismatches, and network issues
-- Resumes interrupted downloads using `Range` requests where supported by the server
-
-## URL Handling
-
-This plugin accepts **all HTTP(S) URLs** and replaces `snakemake-storage-plugin-http`. It provides
-enhanced support for specific sources:
-
-| Source | Checksum | mtime | Immutable |
-|---|---|---|---|
-| `zenodo.org`, `sandbox.zenodo.org` | ✓ (from API) | — | ✓ |
-| `data.pypsa.org` | ✓ (from manifest.yaml) | — | ✓ |
-| `storage.googleapis.com` | ✓ (from GCS API) | ✓ | — |
-| any other HTTP(S) | — | ✓ (Last-Modified) | — |
-
-Generic HTTP URLs are treated as mutable: size and mtime are read from `Content-Length` and
-`Last-Modified` response headers. Servers that do not support `HEAD` requests are handled
-gracefully (size and mtime default to 0).
+See [cache guarantees and operational limits](docs/cache.md) and the
+[implementation plan](docs/plans/plan-cached-http-improvements.org).
 
 ## License
 
