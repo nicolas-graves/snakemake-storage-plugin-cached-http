@@ -67,6 +67,13 @@ local storage, not a boundary against malicious users with write access.
 Materialization makes an independent atomic copy so a job cannot mutate cached
 bytes by editing a hardlink. No scientific format assumptions are applied.
 
+Consumers may explicitly call `validation.validate_file` or
+`validation.materialize_validated` before publishing their own raw outputs.
+These opt-in checks reject empty/HTML responses and validate selected standard
+file signatures, ZIP integrity and JSON syntax. JSON API error interpretation
+is separately opt-in. They do not change provider policy or replace scientific
+schema validation in the consuming workflow.
+
 ## Transfer and resume
 
 A failed refresh leaves both previous receipt and staging output intact. No stale
