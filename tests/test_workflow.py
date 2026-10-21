@@ -78,15 +78,19 @@ def test_processes_download_once(server, tmp_path):
     assert all((tmp_path / f"out-{i}").read_bytes() == b"public" for i in range(3))
 
 
-def test_snakemake_dryrun_dag_retrieve_cleanup_rerun(server, tmp_path):
+@pytest.mark.parametrize("execution", ["shell", "run"])
+def test_snakemake_dryrun_dag_retrieve_cleanup_rerun(server, tmp_path, execution):
     url, counts = server
     cache = tmp_path / "cache"
+    execute = ('shell: "cp {input} {output}"' if execution == "shell" else
+               'run:\n        import shutil\n        shutil.copyfile(input[0], output[0])')
     snakefile = tmp_path / "Snakefile"
     snakefile.write_text(f"""
 storage cached_http:
     provider="cached-http",
     cache={str(cache)!r},
     public_cache=True,
+    headers={{"Accept": "application/json"}},
     policy="immutable",
 
 rule all:
@@ -95,7 +99,7 @@ rule all:
 rule download:
     input: storage.cached_http({url!r})
     output: "result"
-    shell: "cp {{input}} {{output}}"
+    {execute}
 """)
 
     def run(*arguments):

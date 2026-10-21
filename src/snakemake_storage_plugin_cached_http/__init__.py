@@ -86,7 +86,9 @@ class StorageProviderSettings(SettingsBase):
     headers: dict[str, str] = field(
         default_factory=dict,
         metadata={
-            "help": "Anonymous representation headers (Accept, Accept-Language, Accept-Encoding, User-Agent)."
+            "help": "Anonymous representation headers as JSON (Accept, Accept-Language, Accept-Encoding, User-Agent).",
+            "parse_func": json.loads,
+            "unparse_func": json.dumps,
         },
     )
     policy: str = field(
