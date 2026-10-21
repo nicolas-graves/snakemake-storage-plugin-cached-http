@@ -8,6 +8,7 @@ import json
 import logging
 import multiprocessing
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -43,6 +44,24 @@ def transport(provider, handler):
 
 def request(url=URL, **headers):
     return RequestIdentity.create(url, headers)
+
+
+def test_rate_limit_reset_formats(monkeypatch):
+    now = datetime(2026, 10, 21, 23, 59, 50, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr("snakemake_storage_plugin_cached_http.time.time", lambda: now)
+    storage = object.__new__(StorageProvider)
+    reset = "2026-10-22 00:00:00+00:00"
+
+    assert storage._get_rate_limit_wait_time(httpx.Headers({
+        "X-RateLimit-Remaining": "1", "X-RateLimit-Reset": reset,
+    })) is None
+    for value in (reset, "2026-10-22T00:00:00Z", str(int(now + 10))):
+        assert storage._get_rate_limit_wait_time(httpx.Headers({
+            "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": value,
+        })) == 11
+    assert storage._get_rate_limit_wait_time(httpx.Headers({
+        "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "invalid",
+    })) == 0
 
 
 def test_request_identity():

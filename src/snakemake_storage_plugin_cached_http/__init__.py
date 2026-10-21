@@ -10,7 +10,7 @@ import tempfile
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from logging import Logger
 from pathlib import Path
@@ -315,10 +315,21 @@ class StorageProvider(StorageProviderBase):
             float | None: Wait time in seconds if rate limited, None otherwise
         """
         remaining = int(headers.get("X-RateLimit-Remaining", 100))
-        reset_time = int(headers.get("X-RateLimit-Reset", 0))
 
         if remaining >= 1:
             return None
+
+        reset = headers.get("X-RateLimit-Reset", "0")
+        try:
+            reset_time = int(reset)
+        except ValueError:
+            try:
+                reset_date = datetime.fromisoformat(reset.replace("Z", "+00:00"))
+                if reset_date.tzinfo is None:
+                    reset_date = reset_date.replace(tzinfo=timezone.utc)
+                reset_time = reset_date.timestamp()
+            except ValueError:
+                reset_time = 0
 
         wait_seconds = max(0, reset_time - time.time() + 1)
         return wait_seconds
@@ -351,7 +362,8 @@ class StorageProvider(StorageProviderBase):
 
                 yield response
         except Exception as e:
-            logger.warning(f"{type(e).__name__} during public HTTP request")
+            public_url = urlparse(url)._replace(query="", fragment="").geturl()
+            logger.warning(f"{type(e).__name__} during public HTTP request to {public_url}")
             raise
 
     @asynccontextmanager
