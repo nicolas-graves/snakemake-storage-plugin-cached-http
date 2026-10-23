@@ -6,10 +6,13 @@ explicitly before publishing their own raw outputs.
 """
 
 import json
+import os
 import zipfile
 from pathlib import Path
 
-from .cache import atomic_copy
+import platformdirs
+
+from .cache import Cache, RequestIdentity, atomic_copy, checksum
 
 
 def validate_file(path, format=None, *, reject_api_errors=False):
@@ -40,8 +43,47 @@ def validate_file(path, format=None, *, reject_api_errors=False):
             raise ValueError(f"Source API error: {document['error']}")
 
 
-def materialize_validated(source, destination, format=None, *, reject_api_errors=False):
-    """Validate and atomically copy; leave an existing destination intact on error."""
+def discard_staged(source, cache=None):
+    """Drop the cache generation a staged storage input still is; True if dropped.
+
+    Staged inputs are named by request identity key. Anything else, or a cache
+    entry since refreshed to other bytes, is left alone. ``cache`` defaults to
+    the provider's default root.
+    """
+    if cache is None:
+        cache = os.environ.get(
+            "SNAKEMAKE_STORAGE_CACHED_HTTP_CACHE",
+            platformdirs.user_cache_dir("snakemake-pypsa-eur", ensure_exists=False),
+        )
+    if not cache:
+        return False
+    source = Path(source)
+    # Look before Cache/lock: both create directories.
+    receipt = Path(cache).expanduser() / "v1" / source.name / "receipt.json"
+    try:
+        document = json.loads(receipt.read_text())["identity"]
+        identity = RequestIdentity(
+            document["url"], tuple(sorted(document["headers"].items()))
+        )
+        if identity.key != source.name:
+            return False
+        return Cache(Path(cache)).discard(identity, checksum(source))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def materialize_validated(
+    source, destination, format=None, *, reject_api_errors=False, cache=None
+):
+    """Validate and atomically copy; leave an existing destination intact on error.
+
+    A rejected storage input is also discarded from the persistent cache it was
+    staged from (``cache``, see ``discard_staged``) so it is not reused.
+    """
     kind = format or Path(destination).suffix.lstrip(".").lower()
-    validate_file(source, kind, reject_api_errors=reject_api_errors)
+    try:
+        validate_file(source, kind, reject_api_errors=reject_api_errors)
+    except (ValueError, zipfile.BadZipFile):
+        discard_staged(source, cache)
+        raise
     atomic_copy(Path(source), Path(destination))

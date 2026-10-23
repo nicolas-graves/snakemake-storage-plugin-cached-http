@@ -4,6 +4,7 @@
 import asyncio
 import logging
 import multiprocessing
+import os
 import subprocess
 import sys
 import threading
@@ -143,3 +144,68 @@ rule download:
     run("--dry-run")
     assert counts["GET"] == 1
     assert "Nothing to be done" in run()
+
+
+def test_rejected_body_is_not_reused_by_next_run(tmp_path):
+    # A maintenance page served once must not stick under immutable policy.
+    bodies = [b"<!DOCTYPE html><title>Maintenance en cours</title>", b"a,b\n1,2\n"]
+    gets = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = bodies[min(len(gets), 1)]
+            gets.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=http.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{http.server_port}/workbook.csv"
+    (tmp_path / "Snakefile").write_text(f"""
+import os
+
+storage cached_http:
+    provider="cached-http",
+    cache=os.environ["SNAKEMAKE_STORAGE_CACHED_HTTP_CACHE"],
+    public_cache=True,
+    policy="immutable",
+    skip_remote_checks=True,
+
+rule download:
+    input: source=storage.cached_http({url!r})
+    output: "result.csv"
+    run:
+        from snakemake_storage_plugin_cached_http.validation import materialize_validated
+        materialize_validated(input.source, output[0], reject_api_errors=True)
+""")
+    environment = {
+        **os.environ,
+        "SNAKEMAKE_STORAGE_CACHED_HTTP_CACHE": str(tmp_path / "cache"),
+    }
+
+    def run():
+        return subprocess.run(
+            [sys.executable, "-m", "snakemake", "--profile", "none",
+             "--workflow-profile", "none", "--scheduler", "greedy", "--cores", "1"],
+            cwd=tmp_path, env=environment, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+
+    try:
+        first = run()
+        assert first.returncode != 0
+        assert "HTML response where source data was expected" in first.stdout
+        second = run()
+        assert second.returncode == 0, second.stdout
+    finally:
+        http.shutdown()
+        thread.join()
+        http.server_close()
+    assert (tmp_path / "result.csv").read_bytes() == b"a,b\n1,2\n"
+    assert len(gets) == 2

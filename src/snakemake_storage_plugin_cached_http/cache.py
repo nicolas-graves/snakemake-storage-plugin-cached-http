@@ -318,6 +318,23 @@ class Cache:
         self._write_receipt(request, updated)
         return updated
 
+    def discard(self, request, digest):
+        """Drop the current generation if it still holds ``digest``; True if dropped.
+
+        For bytes a consumer rejected: the next retrieval downloads again
+        (unconditionally) instead of reusing them. A newer generation is kept.
+        """
+        with self.sync_lock(request):
+            receipt = self.inspect(request)
+            if receipt is None or receipt["sha256"] != digest:
+                return False
+            directory = self._get_cache_path(request)
+            # Receipt first: interruption leaves an ignored orphan, never a hit.
+            (directory / "receipt.json").unlink()
+            sync_directory(directory)
+            (directory / digest).unlink(missing_ok=True)
+            return True
+
     def import_file(self, request, filepath, *, metadata=None, publisher_checksum=None):
         """Import public bytes offline; validators are unknown unless supplied.
 

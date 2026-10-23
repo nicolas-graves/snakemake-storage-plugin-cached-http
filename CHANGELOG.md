@@ -5,6 +5,14 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # Changelog
 
+## Unreleased
+
+- `validation.materialize_validated` discards a rejected staged input from the
+  persistent cache (only while it is still the current generation), so a body such
+  as a maintenance HTML page is downloaded again on the next run instead of being
+  reused indefinitely under immutable or not-yet-due checked policy. It takes an
+  optional `cache=` root; `Cache.discard(request, digest)` is the underlying API.
+
 ## v0.4 — Generic HTTP(S) support and resumable downloads
 
 - Generic HTTP(S) fallback: any `http://` or `https://` URL is now accepted, with size and

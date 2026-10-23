@@ -107,7 +107,9 @@ Every cache hit checks size, SHA-256 and any publisher checksum. Local integrity
 hashes do not establish publisher authenticity. Corrupt entries are misses online
 and errors offline. Per-identity POSIX process locks deduplicate writers, and
 atomic fsynced publication preserves previous generations on interrupted refresh.
-Staging uses copies, never writable hardlinks. There is no automatic eviction.
+Staging uses copies, never writable hardlinks. There is no automatic eviction,
+except that `validation.materialize_validated` discards a staged body it rejects
+(e.g. an HTML maintenance page) so the next run downloads it again.
 
 Old URL-shaped cache entries are not read implicitly. Import approved public bytes
 using the supported offline API:

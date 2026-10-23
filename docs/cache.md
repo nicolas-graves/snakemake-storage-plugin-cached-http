@@ -53,7 +53,8 @@ then syncs and atomically replaces the receipt and syncs the directory again.
 This ordering covers process interruption and requests filesystem durability via
 fsync; hardware/filesystem implementations must honor those operations for
 power-loss durability. Orphans from interruption are ignored. Existing generations
-are retained without eviction; garbage collection is not included.
+are retained without eviction; garbage collection is not included. The one
+exception is `Cache.discard`, used for bytes a consumer rejected (below).
 
 Use a POSIX filesystem with working cross-process flock, atomic same-filesystem
 rename and directory fsync. Windows is unsupported. Network/shared filesystems
@@ -73,6 +74,19 @@ These opt-in checks reject empty/HTML responses and validate selected standard
 file signatures, ZIP integrity and JSON syntax. JSON API error interpretation
 is separately opt-in. They do not change provider policy or replace scientific
 schema validation in the consuming workflow.
+
+When `materialize_validated` rejects a staged storage input, it also discards that
+body from the persistent cache: staged inputs are named by identity key, and under
+the identity lock the receipt and body are removed only if the receipt still names
+the rejected bytes' SHA-256. A generation refreshed meanwhile, or any file that is
+not a staged input, is left alone. The next retrieval then downloads again,
+unconditionally, whatever the policy, so a maintenance page served in place of a
+workbook is not reused as an immutable or not-yet-due entry. The cache root
+defaults to `SNAKEMAKE_STORAGE_CACHED_HTTP_CACHE`, then the provider's default;
+pass `cache=` when the Snakefile sets another root. A staged copy kept with
+`--keep-storage-local-copies` is not removed and must be deleted to retry.
+`validate_file` alone never touches the cache; a `fetch` client rejecting a body
+calls `Cache.discard(identity, sha256)` itself.
 
 ## Transfer and resume
 
