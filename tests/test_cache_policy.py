@@ -243,6 +243,27 @@ async def test_reject_private_responses(tmp_path, headers):
 
 
 @pytest.mark.asyncio
+async def test_cors_vary_is_cacheable_when_the_request_is_not_cross_origin(tmp_path):
+    p = provider(tmp_path)
+    cors = "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+    transport(p, lambda req: httpx.Response(200, content=b"zip", headers={"vary": cors}))
+    await p.fetch(URL, tmp_path / "out")
+    assert (tmp_path / "out").read_bytes() == b"zip"
+    assert p.cache.get(request()) is not None
+    await p._client.aclose()
+
+
+def test_cors_vary_is_rejected_when_the_request_sent_origin():
+    from snakemake_storage_plugin_cached_http.retrieval import validate_response
+
+    sent = httpx.Request("GET", URL, headers={"Origin": "https://example.org"})
+    with pytest.raises(ValueError, match="unsupported representation"):
+        validate_response(httpx.Response(200, headers={"vary": "Origin"}, request=sent))
+    plain = httpx.Request("GET", URL)
+    validate_response(httpx.Response(200, headers={"vary": "Origin"}, request=plain))
+
+
+@pytest.mark.asyncio
 async def test_redirect_and_credential_redirect(tmp_path):
     p = provider(tmp_path)
 

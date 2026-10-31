@@ -7,6 +7,9 @@ SPDX-License-Identifier: CC-BY-4.0
 
 ## Unreleased
 
+- A response whose `Vary` names only CORS request headers (`Origin`,
+  `Access-Control-Request-Method`, `Access-Control-Request-Headers`) is cacheable
+  when the request sent none of them, as for INSEE's Melodi file API.
 - `validation.materialize_validated` discards a rejected staged input from the
   persistent cache (only while it is still the current generation), so a body such
   as a maintenance HTML page is downloaded again on the next run instead of being

@@ -20,6 +20,14 @@ import httpx
 
 SCHEMA = 1
 REPRESENTATION_HEADERS = {"accept", "accept-language", "accept-encoding", "user-agent"}
+# CORS dimensions vary a response only for a request carrying these headers
+# (a browser's cross-origin request or preflight); without them, every client
+# receives the same representation.
+CORS_REQUEST_HEADERS = {
+    "origin",
+    "access-control-request-method",
+    "access-control-request-headers",
+}
 DEFAULT_HEADERS = {
     "accept": "*/*",
     "accept-encoding": "identity",

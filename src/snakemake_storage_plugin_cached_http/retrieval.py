@@ -15,6 +15,7 @@ import httpx
 from tqdm_loggable.auto import tqdm
 
 from .cache import (
+    CORS_REQUEST_HEADERS,
     REPRESENTATION_HEADERS,
     Cache,
     RequestIdentity,
@@ -51,7 +52,8 @@ def validate_response(response, *, cacheable=True, allow_cookies=False):
     ):
         raise ValueError("Response is not eligible for the public cache")
     vary = {v.strip().lower() for v in headers.get("vary", "").split(",") if v.strip()}
-    if cacheable and vary - REPRESENTATION_HEADERS:
+    sent = {name.lower() for name in response.request.headers}
+    if cacheable and vary - REPRESENTATION_HEADERS - (CORS_REQUEST_HEADERS - sent):
         raise ValueError(
             "Response Vary contains an unsupported representation dimension"
         )
